@@ -141,6 +141,13 @@ def generate_launch_description():
             description="Whether to use high-resolution segmentation masks if available in the model, enhancing mask quality for segmentation",
         )
 
+        save_results = LaunchConfiguration("save_results")
+        save_results_cmd = DeclareLaunchArgument(
+            "save_results",
+            default_value="True",
+            description="Whether to save prediction results",
+        )
+
         input_image_topic = LaunchConfiguration("input_image_topic")
         input_image_topic_cmd = DeclareLaunchArgument(
             "input_image_topic",
@@ -256,6 +263,7 @@ def generate_launch_description():
                     "agnostic_nms": agnostic_nms,
                     "retina_masks": retina_masks,
                     "image_reliability": image_reliability,
+                    "save_results": save_results,
                 }
             ],
             remappings=[("image_raw", input_image_topic)],
@@ -323,6 +331,7 @@ def generate_launch_description():
             augment_cmd,
             agnostic_nms_cmd,
             retina_masks_cmd,
+            save_results_cmd,
             input_image_topic_cmd,
             image_reliability_cmd,
             input_depth_topic_cmd,

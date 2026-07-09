@@ -264,7 +264,8 @@ class YoloNode(LifecycleNode):
                 if results.keypoints and keypoints:
                     aux_msg.keypoints = keypoints[i]
                 detections_msg.detections.append(aux_msg)
-            results.save(filename=f"result_multi_{counter}.jpg")  # save to disk
+            if self.save_results:
+                results.save(filename=f"result_multi_{counter}.jpg")  # save to disk
             counter += 1
             detections_msg.header = img.header
             detections_array.append(detections_msg)
@@ -297,7 +298,8 @@ class YoloNode(LifecycleNode):
         hypothesis = self.parse_hypothesis(results) if (results.boxes or results.obb) else []
         boxes = self.parse_boxes(results) if (results.boxes or results.obb) else []
         keypoints = self.parse_keypoints(results) if results.keypoints else []
-        # results.save(filename="result_single.jpg")  # save to disk
+        if self.save_results:
+            results.save(filename="result_single.jpg")  # save to disk
 
         for i in range(len(results)):
             aux_msg = Detection()
