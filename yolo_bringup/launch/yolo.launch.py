@@ -47,7 +47,36 @@ def generate_launch_description():
         model_cmd = DeclareLaunchArgument(
             "model",
             default_value="yolov8m.pt",
-            description="Model name or path",
+            description="Model name or path (comma-separated for ensemble, e.g. 'a.pt,b.pt')",
+        )
+
+        ensemble_method = LaunchConfiguration("ensemble_method")
+        ensemble_method_cmd = DeclareLaunchArgument(
+            "ensemble_method",
+            default_value="wbf",
+            choices=["wbf", "nms"],
+            description="How to merge detections of multiple models (wbf: weighted boxes fusion, nms: keep the most confident one)",
+        )
+
+        ensemble_iou = LaunchConfiguration("ensemble_iou")
+        ensemble_iou_cmd = DeclareLaunchArgument(
+            "ensemble_iou",
+            default_value="0.55",
+            description="IoU threshold to regard detections of different models as the same object",
+        )
+
+        ensemble_min_votes = LaunchConfiguration("ensemble_min_votes")
+        ensemble_min_votes_cmd = DeclareLaunchArgument(
+            "ensemble_min_votes",
+            default_value="1",
+            description="Minimum number of models that must detect an object for it to be output",
+        )
+
+        ensemble_mask_threshold = LaunchConfiguration("ensemble_mask_threshold")
+        ensemble_mask_threshold_cmd = DeclareLaunchArgument(
+            "ensemble_mask_threshold",
+            default_value="0.5",
+            description="Confidence-weighted vote ratio for a pixel to be kept in the fused mask (wbf only)",
         )
 
         tracker = LaunchConfiguration("tracker")
@@ -264,6 +293,10 @@ def generate_launch_description():
                     "retina_masks": retina_masks,
                     "image_reliability": image_reliability,
                     "save_results": save_results,
+                    "ensemble_method": ensemble_method,
+                    "ensemble_iou": ensemble_iou,
+                    "ensemble_min_votes": ensemble_min_votes,
+                    "ensemble_mask_threshold": ensemble_mask_threshold,
                 }
             ],
             remappings=[("image_raw", input_image_topic)],
@@ -318,6 +351,10 @@ def generate_launch_description():
             as_server_cmd,
             model_type_cmd,
             model_cmd,
+            ensemble_method_cmd,
+            ensemble_iou_cmd,
+            ensemble_min_votes_cmd,
+            ensemble_mask_threshold_cmd,
             tracker_cmd,
             device_cmd,
             yolo_encoding_cmd,

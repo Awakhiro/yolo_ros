@@ -14,6 +14,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
+import os
 from typing import List, Dict
 
 import cv2
@@ -30,7 +31,9 @@ from rclpy.lifecycle import TransitionCallbackReturn
 from rclpy.lifecycle import LifecycleState
 
 import torch
+from torchvision.ops import box_iou
 from ultralytics import YOLO, YOLOWorld, YOLOE
+from ultralytics.utils import ops
 from ultralytics.engine.results import Results
 from ultralytics.engine.results import Boxes
 from ultralytics.engine.results import Masks
@@ -75,6 +78,12 @@ class YoloNode(LifecycleNode):
         self.declare_parameter("save_results", True)
         self.declare_parameter("split_masks_enabled", True)
 
+        # ensemble params ("model" にカンマ区切りで複数指定したときのみ使用)
+        self.declare_parameter("ensemble_method", "wbf")
+        self.declare_parameter("ensemble_iou", 0.55)
+        self.declare_parameter("ensemble_min_votes", 1)
+        self.declare_parameter("ensemble_mask_threshold", 0.5)
+
         self.type_to_model = {"YOLO": YOLO, "World": YOLOWorld, "YOLOE": YOLOE}
 
     def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
@@ -88,6 +97,10 @@ class YoloNode(LifecycleNode):
             self.get_parameter("model_type").get_parameter_value().string_value
         )
         self.model = self.get_parameter("model").get_parameter_value().string_value
+        # "a.pt,b.pt" のように複数指定するとアンサンブル推論になる
+        self.model_paths = [
+            os.path.expanduser(m.strip()) for m in self.model.split(",") if m.strip()
+        ]
         self.device = self.get_parameter("device").get_parameter_value().string_value
         self.yolo_encoding = (
             self.get_parameter("yolo_encoding").get_parameter_value().string_value
@@ -121,6 +134,27 @@ class YoloNode(LifecycleNode):
             self.get_parameter("split_masks_enabled").get_parameter_value().bool_value
         )
 
+        # ensemble params
+        self.ensemble_method = (
+            self.get_parameter("ensemble_method").get_parameter_value().string_value
+        )
+        if self.ensemble_method not in ("wbf", "nms"):
+            self.get_logger().error(
+                f"Unknown ensemble_method '{self.ensemble_method}' (wbf or nms)"
+            )
+            return TransitionCallbackReturn.ERROR
+        self.ensemble_iou = (
+            self.get_parameter("ensemble_iou").get_parameter_value().double_value
+        )
+        self.ensemble_min_votes = (
+            self.get_parameter("ensemble_min_votes").get_parameter_value().integer_value
+        )
+        self.ensemble_mask_threshold = (
+            self.get_parameter("ensemble_mask_threshold")
+            .get_parameter_value()
+            .double_value
+        )
+
         # ros params
         self.enable = self.get_parameter("enable").get_parameter_value().bool_value
         self.reliability = (
@@ -146,26 +180,55 @@ class YoloNode(LifecycleNode):
     def on_activate(self, state: LifecycleState) -> TransitionCallbackReturn:
         self.get_logger().info(f"[{self.get_name()}] Activating...")
 
-        try:
-            self.yolo = self.type_to_model[self.model_type](self.model)
-        except FileNotFoundError:
-            self.get_logger().error(f"Model file '{self.model}' does not exists")
-            return TransitionCallbackReturn.ERROR
-        # YOLOE does not support fusing
-        if isinstance(self.yolo, YOLO) or isinstance(self.yolo, YOLOWorld):
+        self.models = []
+        for model_path in self.model_paths:
             try:
-                self.get_logger().info("Trying to fuse model...")
-                self.yolo.fuse()
-            except TypeError as e:
-                self.get_logger().warn(f"Error while fuse: {e}")
+                self.models.append(self.type_to_model[self.model_type](model_path))
+            except FileNotFoundError:
+                self.get_logger().error(f"Model file '{model_path}' does not exists")
+                return TransitionCallbackReturn.ERROR
+        self.yolo = self.models[0]
 
-        # warm up model
-        for _ in range(100):
-            self.yolo.predict(
-                source=torch.zeros(1, 3, 640, 640),
-                device=self.device,
+        if len(self.models) > 1:
+            if self.yolo.task not in ("detect", "segment"):
+                self.get_logger().error(
+                    f"Ensemble supports only detect/segment models, got '{self.yolo.task}'"
+                )
+                return TransitionCallbackReturn.ERROR
+            for model_path, model in zip(self.model_paths[1:], self.models[1:]):
+                if model.task != self.yolo.task or model.names != self.yolo.names:
+                    self.get_logger().error(
+                        f"Model '{model_path}' ({model.task}, {model.names}) does not match "
+                        f"'{self.model_paths[0]}' ({self.yolo.task}, {self.yolo.names})"
+                    )
+                    return TransitionCallbackReturn.ERROR
+            if self.ensemble_min_votes > len(self.models):
+                self.get_logger().warn(
+                    f"ensemble_min_votes ({self.ensemble_min_votes}) exceeds the number "
+                    f"of models ({len(self.models)}), no detection will be output"
+                )
+            self.get_logger().info(
+                f"Ensemble of {len(self.models)} models "
+                f"(method={self.ensemble_method}, iou={self.ensemble_iou}, "
+                f"min_votes={self.ensemble_min_votes}): {self.model_paths}"
             )
-            self.get_logger().info("Warming up model...")
+
+        for model in self.models:
+            # YOLOE does not support fusing
+            if isinstance(model, YOLO) or isinstance(model, YOLOWorld):
+                try:
+                    self.get_logger().info("Trying to fuse model...")
+                    model.fuse()
+                except TypeError as e:
+                    self.get_logger().warn(f"Error while fuse: {e}")
+
+            # warm up model
+            for _ in range(100):
+                model.predict(
+                    source=torch.zeros(1, 3, 640, 640),
+                    device=self.device,
+                )
+                self.get_logger().info("Warming up model...")
 
         self._enable_srv = self.create_service(SetBool, "enable", self.enable_cb)
 
@@ -204,6 +267,7 @@ class YoloNode(LifecycleNode):
         self.get_logger().info(f"[{self.get_name()}] Deactivating...")
 
         del self.yolo
+        del self.models
         if "cuda" in self.device:
             self.get_logger().info("Clearing CUDA cache")
             torch.cuda.empty_cache()
@@ -221,26 +285,115 @@ class YoloNode(LifecycleNode):
             self.destroy_service(self._predict_multiple_srv)
             self._predict_multiple_srv = None
 
+    def predict(self, source) -> List[Results]:
+        results_per_model = [
+            model.predict(
+                source=source,
+                verbose=False,
+                stream=False,
+                conf=self.threshold,
+                iou=self.iou,
+                imgsz=(self.imgsz_height, self.imgsz_width),
+                half=self.half,
+                max_det=self.max_det,
+                augment=self.augment,
+                agnostic_nms=self.agnostic_nms,
+                retina_masks=self.retina_masks,
+                device=self.device,
+                rect=self.rect,
+            )
+            for model in self.models
+        ]
+        if len(results_per_model) == 1:
+            return results_per_model[0]
+        # 画像ごとに各モデルの結果を統合する
+        return [self.ensemble_results(list(r)) for r in zip(*results_per_model)]
+
+    def ensemble_results(self, results_list: List[Results]) -> Results:
+        base = results_list[0]
+
+        boxes, masks, model_ids = [], [], []
+        for model_id, results in enumerate(results_list):
+            if results.boxes is None or len(results.boxes) == 0:
+                continue
+            boxes.append(results.boxes.data)
+            model_ids += [model_id] * len(results.boxes)
+            if results.masks is not None:
+                masks.append(results.masks.data.float())
+
+        if not boxes:
+            return base
+
+        # 推論解像度がモデル間で異なる場合は元画像サイズに揃える
+        if any(m.shape[1:] != masks[0].shape[1:] for m in masks):
+            masks = [
+                ops.scale_masks(m[None], base.orig_shape)[0].gt_(0.5) for m in masks
+            ]
+
+        boxes = torch.cat(boxes)
+        masks = torch.cat(masks) if masks else None
+
+        # 信頼度の高い順に、IoU が ensemble_iou を超える他モデルの検出を同じクラスタにまとめる
+        # (1クラスタに含まれる検出は各モデル高々1つ = クラスタサイズが得票数)
+        ious = box_iou(boxes[:, :4], boxes[:, :4]).tolist()
+        classes = boxes[:, 5].tolist()
+        clusters: List[List[int]] = []
+        for i in boxes[:, 4].argsort(descending=True).tolist():
+            best, best_iou = None, self.ensemble_iou
+            for cluster in clusters:
+                top = cluster[0]
+                if not self.agnostic_nms and classes[top] != classes[i]:
+                    continue
+                if any(model_ids[j] == model_ids[i] for j in cluster):
+                    continue
+                if ious[top][i] > best_iou:
+                    best, best_iou = cluster, ious[top][i]
+            if best is None:
+                clusters.append([i])
+            else:
+                best.append(i)
+
+        fused_boxes, fused_masks = [], []
+        for cluster in clusters:
+            if len(cluster) < self.ensemble_min_votes:
+                continue
+
+            top = cluster[0]
+            if self.ensemble_method == "nms":
+                fused_boxes.append(boxes[top])
+                if masks is not None:
+                    fused_masks.append(masks[top])
+                continue
+
+            # WBF: box は信頼度で重み付け平均、mask は信頼度で重み付けした投票
+            # スコアは検出しなかったモデルを 0 として平均する
+            conf = boxes[cluster, 4]
+            weights = conf / conf.sum()
+            box = boxes[top].clone()
+            box[:4] = (boxes[cluster, :4] * weights[:, None]).sum(0)
+            box[4] = conf.sum() / len(results_list)
+            if masks is not None:
+                mask = (masks[cluster] * weights[:, None, None]).sum(0)
+                mask = (mask >= self.ensemble_mask_threshold).float()
+                if not mask.any():
+                    continue
+                fused_masks.append(mask)
+            fused_boxes.append(box)
+
+        return Results(
+            base.orig_img,
+            path=base.path,
+            names=base.names,
+            boxes=torch.stack(fused_boxes) if fused_boxes else boxes[:0],
+            masks=torch.stack(fused_masks) if fused_masks else None,
+        )
+
     def predict_multiple_cb(self, request: PredictMultiple.Request, response: PredictMultiple.Response) -> PredictMultiple.Response:
         # バッチ画像推論
         cv_images = [self.cv_bridge.imgmsg_to_cv2(img, desired_encoding=self.yolo_encoding) for img in request.images]
         if not cv_images:
             return response
-        results_list = self.yolo.predict(
-            source=cv_images,
-            verbose=False,
-            stream=False,
-            conf=self.threshold,
-            iou=self.iou,
-            imgsz=(self.imgsz_height, self.imgsz_width),
-            half=self.half,
-            max_det=self.max_det,
-            augment=self.augment,
-            agnostic_nms=self.agnostic_nms,
-            retina_masks=self.retina_masks,
-            device=self.device,
-            rect=self.rect,
-        )
+        results_list = self.predict(cv_images)
 
         detections_array = []
         counter = 0
@@ -276,21 +429,7 @@ class YoloNode(LifecycleNode):
     def predict_single_cb(self, request: PredictSingle.Request, response: PredictSingle.Response) -> PredictSingle.Response:
         # 画像をcv2に変換
         cv_image = self.cv_bridge.imgmsg_to_cv2(request.image, desired_encoding=self.yolo_encoding)
-        results = self.yolo.predict(
-            source=cv_image,
-            verbose=False,
-            stream=False,
-            conf=self.threshold,
-            iou=self.iou,
-            imgsz=(self.imgsz_height, self.imgsz_width),
-            half=self.half,
-            max_det=self.max_det,
-            augment=self.augment,
-            agnostic_nms=self.agnostic_nms,
-            retina_masks=self.retina_masks,
-            device=self.device,
-            rect=self.rect,
-        )
+        results = self.predict(cv_image)
         results: Results = results[0].cpu()
 
         detections_msg = DetectionArray()
@@ -528,21 +667,7 @@ class YoloNode(LifecycleNode):
             cv_image = self.cv_bridge.imgmsg_to_cv2(
                 msg, desired_encoding=self.yolo_encoding
             )
-            results = self.yolo.predict(
-                source=cv_image,
-                verbose=False,
-                stream=False,
-                conf=self.threshold,
-                iou=self.iou,
-                imgsz=(self.imgsz_height, self.imgsz_width),
-                half=self.half,
-                max_det=self.max_det,
-                augment=self.augment,
-                agnostic_nms=self.agnostic_nms,
-                retina_masks=self.retina_masks,
-                device=self.device,
-                rect=self.rect,
-            )
+            results = self.predict(cv_image)
             results: Results = results[0].cpu()
 
             if results.boxes or results.obb:
@@ -590,7 +715,8 @@ class YoloNode(LifecycleNode):
         res: SetClasses.Response,
     ) -> SetClasses.Response:
         self.get_logger().info(f"Setting classes: {req.classes}")
-        self.yolo.set_classes(req.classes)
+        for model in self.models:
+            model.set_classes(req.classes)
         self.get_logger().info(f"New classes: {self.yolo.names}")
         return res
 
