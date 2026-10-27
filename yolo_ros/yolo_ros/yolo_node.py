@@ -31,6 +31,7 @@ from rclpy.lifecycle import TransitionCallbackReturn
 from rclpy.lifecycle import LifecycleState
 
 import torch
+import torch.nn.functional as F
 from torchvision.ops import box_iou
 from ultralytics import YOLO, YOLOWorld, YOLOE
 from ultralytics.utils import ops
@@ -78,11 +79,16 @@ class YoloNode(LifecycleNode):
         self.declare_parameter("save_results", True)
         self.declare_parameter("split_masks_enabled", True)
 
+        # モデルごとの入力サイズ ("1024,640" や "1024x768,640")。空なら imgsz_height/width
+        self.declare_parameter("model_imgsz", "")
+
         # ensemble params ("model" にカンマ区切りで複数指定したときのみ使用)
+        # threshold は統合後のスコアにかけ、各モデルは ensemble_model_threshold で推論する
         self.declare_parameter("ensemble_method", "wbf")
-        self.declare_parameter("ensemble_iou", 0.55)
+        self.declare_parameter("ensemble_iou", 0.5)
         self.declare_parameter("ensemble_min_votes", 1)
         self.declare_parameter("ensemble_mask_threshold", 0.5)
+        self.declare_parameter("ensemble_model_threshold", 0.05)
 
         self.type_to_model = {"YOLO": YOLO, "World": YOLOWorld, "YOLOE": YOLOE}
 
@@ -134,6 +140,29 @@ class YoloNode(LifecycleNode):
             self.get_parameter("split_masks_enabled").get_parameter_value().bool_value
         )
 
+        model_imgsz = (
+            self.get_parameter("model_imgsz").get_parameter_value().string_value
+        )
+        if model_imgsz.strip():
+            try:
+                self.model_imgsz = [
+                    tuple(int(v) for v in s.split("x")) if "x" in s else (int(s),) * 2
+                    for s in (s.strip() for s in model_imgsz.split(","))
+                ]
+            except ValueError:
+                self.model_imgsz = []
+            if len(self.model_imgsz) != len(self.model_paths) or any(
+                len(s) != 2 for s in self.model_imgsz
+            ):
+                self.get_logger().error(
+                    f"Invalid model_imgsz '{model_imgsz}' for {len(self.model_paths)} model(s)"
+                )
+                return TransitionCallbackReturn.ERROR
+        else:
+            self.model_imgsz = [(self.imgsz_height, self.imgsz_width)] * len(
+                self.model_paths
+            )
+
         # ensemble params
         self.ensemble_method = (
             self.get_parameter("ensemble_method").get_parameter_value().string_value
@@ -151,6 +180,11 @@ class YoloNode(LifecycleNode):
         )
         self.ensemble_mask_threshold = (
             self.get_parameter("ensemble_mask_threshold")
+            .get_parameter_value()
+            .double_value
+        )
+        self.ensemble_model_threshold = (
+            self.get_parameter("ensemble_model_threshold")
             .get_parameter_value()
             .double_value
         )
@@ -210,7 +244,10 @@ class YoloNode(LifecycleNode):
             self.get_logger().info(
                 f"Ensemble of {len(self.models)} models "
                 f"(method={self.ensemble_method}, iou={self.ensemble_iou}, "
-                f"min_votes={self.ensemble_min_votes}): {self.model_paths}"
+                f"min_votes={self.ensemble_min_votes}, "
+                f"model_threshold={self.ensemble_model_threshold}, "
+                f"threshold={self.threshold}): "
+                f"{list(zip(self.model_paths, self.model_imgsz))}"
             )
 
         for model in self.models:
@@ -266,6 +303,7 @@ class YoloNode(LifecycleNode):
     def on_deactivate(self, state: LifecycleState) -> TransitionCallbackReturn:
         self.get_logger().info(f"[{self.get_name()}] Deactivating...")
 
+        is_world = isinstance(self.yolo, YOLOWorld)
         del self.yolo
         del self.models
         if "cuda" in self.device:
@@ -275,25 +313,36 @@ class YoloNode(LifecycleNode):
         self.destroy_service(self._enable_srv)
         self._enable_srv = None
 
-        if isinstance(self.yolo, YOLOWorld):
+        if is_world:
             self.destroy_service(self._set_classes_srv)
             self._set_classes_srv = None
 
+        if self.as_server:
             self.destroy_service(self._predict_single_srv)
             self._predict_single_srv = None
 
             self.destroy_service(self._predict_multiple_srv)
             self._predict_multiple_srv = None
+        else:
+            self.destroy_subscription(self._sub)
+            self._sub = None
+
+        super().on_deactivate(state)
+        self.get_logger().info(f"[{self.get_name()}] Deactivated")
+
+        return TransitionCallbackReturn.SUCCESS
 
     def predict(self, source) -> List[Results]:
+        # アンサンブル時は各モデルを低いしきい値で推論し、threshold は統合後にかける
+        conf = self.ensemble_model_threshold if len(self.models) > 1 else self.threshold
         results_per_model = [
             model.predict(
                 source=source,
                 verbose=False,
                 stream=False,
-                conf=self.threshold,
+                conf=conf,
                 iou=self.iou,
-                imgsz=(self.imgsz_height, self.imgsz_width),
+                imgsz=imgsz,
                 half=self.half,
                 max_det=self.max_det,
                 augment=self.augment,
@@ -302,12 +351,29 @@ class YoloNode(LifecycleNode):
                 device=self.device,
                 rect=self.rect,
             )
-            for model in self.models
+            for model, imgsz in zip(self.models, self.model_imgsz)
         ]
         if len(results_per_model) == 1:
             return results_per_model[0]
         # 画像ごとに各モデルの結果を統合する
         return [self.ensemble_results(list(r)) for r in zip(*results_per_model)]
+
+    @staticmethod
+    def align_masks(
+        masks: List[torch.Tensor], orig_shape: tuple
+    ) -> List[torch.Tensor]:
+        # レターボックスの余白を除いて拡大縮小し、最も解像度の高いマスクと同じ余白を付け直す
+        h, w = max((m.shape[1:] for m in masks), key=lambda s: s[0] * s[1])
+        gain = min(h / orig_shape[0], w / orig_shape[1])
+        ch, cw = round(orig_shape[0] * gain), round(orig_shape[1] * gain)
+        top, left = round((h - ch) / 2 - 0.1), round((w - cw) / 2 - 0.1)
+        return [
+            F.pad(
+                ops.scale_masks(m[None], (ch, cw))[0],
+                (left, w - cw - left, top, h - ch - top),
+            ).gt_(0.5)
+            for m in masks
+        ]
 
     def ensemble_results(self, results_list: List[Results]) -> Results:
         base = results_list[0]
@@ -324,18 +390,26 @@ class YoloNode(LifecycleNode):
         if not boxes:
             return base
 
-        # 推論解像度がモデル間で異なる場合は元画像サイズに揃える
+        # 入力サイズがモデル間で異なる場合はマスクの解像度を揃える
         if any(m.shape[1:] != masks[0].shape[1:] for m in masks):
-            masks = [
-                ops.scale_masks(m[None], base.orig_shape)[0].gt_(0.5) for m in masks
-            ]
+            masks = self.align_masks(masks, base.orig_shape)
 
         boxes = torch.cat(boxes)
         masks = torch.cat(masks) if masks else None
 
+        # セグメンテーションはマスクの IoU、検出は枠の IoU で同じ物体かを判定する
+        # (細く斜めの cane は交差する別物体でも枠が大きく重なるため)
+        if masks is not None:
+            flat = masks.flatten(1)
+            inter = flat @ flat.T
+            area = flat.sum(1)
+            ious = inter / (area[:, None] + area[None, :] - inter).clamp(min=1)
+        else:
+            ious = box_iou(boxes[:, :4], boxes[:, :4])
+
         # 信頼度の高い順に、IoU が ensemble_iou を超える他モデルの検出を同じクラスタにまとめる
         # (1クラスタに含まれる検出は各モデル高々1つ = クラスタサイズが得票数)
-        ious = box_iou(boxes[:, :4], boxes[:, :4]).tolist()
+        ious = ious.tolist()
         classes = boxes[:, 5].tolist()
         clusters: List[List[int]] = []
         for i in boxes[:, 4].argsort(descending=True).tolist():
@@ -359,6 +433,15 @@ class YoloNode(LifecycleNode):
                 continue
 
             top = cluster[0]
+            conf = boxes[cluster, 4]
+            # nms は最も信頼度の高い検出のスコア、wbf は検出しなかったモデルを 0 とした平均
+            if self.ensemble_method == "nms":
+                score = conf[0]
+            else:
+                score = conf.sum() / len(results_list)
+            if score < self.threshold:
+                continue
+
             if self.ensemble_method == "nms":
                 fused_boxes.append(boxes[top])
                 if masks is not None:
@@ -366,12 +449,10 @@ class YoloNode(LifecycleNode):
                 continue
 
             # WBF: box は信頼度で重み付け平均、mask は信頼度で重み付けした投票
-            # スコアは検出しなかったモデルを 0 として平均する
-            conf = boxes[cluster, 4]
             weights = conf / conf.sum()
             box = boxes[top].clone()
             box[:4] = (boxes[cluster, :4] * weights[:, None]).sum(0)
-            box[4] = conf.sum() / len(results_list)
+            box[4] = score
             if masks is not None:
                 mask = (masks[cluster] * weights[:, None, None]).sum(0)
                 mask = (mask >= self.ensemble_mask_threshold).float()
@@ -456,14 +537,6 @@ class YoloNode(LifecycleNode):
         detections_msg.header = request.image.header
         response.detections = detections_msg
         return response
-
-        self.destroy_subscription(self._sub)
-        self._sub = None
-
-        super().on_deactivate(state)
-        self.get_logger().info(f"[{self.get_name()}] Deactivated")
-
-        return TransitionCallbackReturn.SUCCESS
 
     def on_cleanup(self, state: LifecycleState) -> TransitionCallbackReturn:
         self.get_logger().info(f"[{self.get_name()}] Cleaning up...")
@@ -687,7 +760,7 @@ class YoloNode(LifecycleNode):
 
                 aux_msg = Detection()
 
-                if results.boxes or results.obb and hypothesis and boxes:
+                if (results.boxes or results.obb) and hypothesis and boxes:
                     aux_msg.class_id = hypothesis[i]["class_id"]
                     aux_msg.class_name = hypothesis[i]["class_name"]
                     aux_msg.score = hypothesis[i]["score"]

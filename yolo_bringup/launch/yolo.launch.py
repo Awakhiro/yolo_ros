@@ -18,6 +18,7 @@ from launch import LaunchDescription, LaunchContext
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch.conditions import IfCondition
 
 
@@ -61,8 +62,22 @@ def generate_launch_description():
         ensemble_iou = LaunchConfiguration("ensemble_iou")
         ensemble_iou_cmd = DeclareLaunchArgument(
             "ensemble_iou",
-            default_value="0.55",
-            description="IoU threshold to regard detections of different models as the same object",
+            default_value="0.5",
+            description="IoU threshold to regard detections of different models as the same object (mask IoU for segmentation, box IoU for detection)",
+        )
+
+        ensemble_model_threshold = LaunchConfiguration("ensemble_model_threshold")
+        ensemble_model_threshold_cmd = DeclareLaunchArgument(
+            "ensemble_model_threshold",
+            default_value="0.05",
+            description="Confidence threshold of each model in ensemble ('threshold' is applied to the fused score)",
+        )
+
+        model_imgsz = LaunchConfiguration("model_imgsz")
+        model_imgsz_cmd = DeclareLaunchArgument(
+            "model_imgsz",
+            default_value="",
+            description="Per-model image size in the same order as 'model' (e.g. '1024,640' or '1024x768,640'). Empty uses imgsz_height/imgsz_width",
         )
 
         ensemble_min_votes = LaunchConfiguration("ensemble_min_votes")
@@ -175,6 +190,20 @@ def generate_launch_description():
             "save_results",
             default_value="True",
             description="Whether to save prediction results",
+        )
+
+        rect = LaunchConfiguration("rect")
+        rect_cmd = DeclareLaunchArgument(
+            "rect",
+            default_value="True",
+            description="Whether to use minimal rectangular padding instead of a square input for inference",
+        )
+
+        split_masks_enabled = LaunchConfiguration("split_masks_enabled")
+        split_masks_enabled_cmd = DeclareLaunchArgument(
+            "split_masks_enabled",
+            default_value="True",
+            description="Whether to split a mask with disconnected regions into separate detections",
         )
 
         input_image_topic = LaunchConfiguration("input_image_topic")
@@ -293,10 +322,14 @@ def generate_launch_description():
                     "retina_masks": retina_masks,
                     "image_reliability": image_reliability,
                     "save_results": save_results,
+                    "rect": rect,
+                    "split_masks_enabled": split_masks_enabled,
                     "ensemble_method": ensemble_method,
                     "ensemble_iou": ensemble_iou,
                     "ensemble_min_votes": ensemble_min_votes,
                     "ensemble_mask_threshold": ensemble_mask_threshold,
+                    "ensemble_model_threshold": ensemble_model_threshold,
+                    "model_imgsz": ParameterValue(model_imgsz, value_type=str),
                 }
             ],
             remappings=[("image_raw", input_image_topic)],
@@ -355,6 +388,8 @@ def generate_launch_description():
             ensemble_iou_cmd,
             ensemble_min_votes_cmd,
             ensemble_mask_threshold_cmd,
+            ensemble_model_threshold_cmd,
+            model_imgsz_cmd,
             tracker_cmd,
             device_cmd,
             yolo_encoding_cmd,
@@ -369,6 +404,8 @@ def generate_launch_description():
             agnostic_nms_cmd,
             retina_masks_cmd,
             save_results_cmd,
+            rect_cmd,
+            split_masks_enabled_cmd,
             input_image_topic_cmd,
             image_reliability_cmd,
             input_depth_topic_cmd,
